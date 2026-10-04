@@ -130,8 +130,9 @@ The gates:
 * `--dry-run` validates and prints the plan and writes nothing.
 
 `--device` defaults to the whole disk carrying the running root, derived from
-`findmnt`/`lsblk`.  Because the point of the tool is to update that disk, it is
-also the one case the confirmation exists for.
+`findmnt`/`lsblk`.  That is normally the target, so the plan calls out when the
+target carries the running root; `--yes` is required for every write either
+way.
 
 ### Limits
 
