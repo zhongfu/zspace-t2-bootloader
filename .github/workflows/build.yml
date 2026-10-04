@@ -41,7 +41,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-              bison flex swig gcc-aarch64-linux-gnu dpkg
+              bison flex swig gcc-aarch64-linux-gnu dpkg \
+              python3 python3-dev python3-setuptools python3-pyelftools
 
       - name: Fetch the sources
         run: ./fetch.sh
