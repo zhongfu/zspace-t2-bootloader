@@ -1,8 +1,8 @@
 #!/bin/sh
 # Build mainline U-Boot for the ZSpace T2 (RK3568).
 #
-# Run u-boot/fetch.sh first.  This script installs the board defconfigs and the
-# two board device trees into build/uboot, applies u-boot/patches/*, and builds
+# Run ./fetch.sh first.  This script installs the board defconfigs and the
+# two board device trees into build/uboot, applies patches/*, and builds
 # two images:
 #   u-boot.itb            the *plain* image for the eMMC (boots the eMMC boot
 #                         tree; a held power button selects the card)
@@ -11,7 +11,7 @@
 # plus the matching idbloader.img for each and the initial-environment text
 # files.  Everything lands in build/out/.
 #
-# The defconfig installs the full board configuration - see u-boot/README.md:
+# The defconfig installs the full board configuration - see README.md:
 # the T2 control DT, the power-on gate/LEDs, the env in the FAT boot partition
 # (`:3`) with a bootcount A/B fallback, the rockusb flash workflow.  The
 # installer defconfig is derived from the plain one on every build.
@@ -20,11 +20,12 @@
 # two clean builds produce bit-identical artefacts (U-Boot otherwise embeds the
 # wall-clock build time).
 #
-# Usage: u-boot/build.sh [-h]
+# Usage: ./build.sh [-h]
 set -eu
 
+# The split repo root *is* the old u-boot/ directory, so HERE is ROOT.
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-ROOT=$(CDPATH= cd -- "$HERE/.." && pwd)
+ROOT=$HERE
 
 BUILD=${BUILD:-$ROOT/build}
 UBOOT=${UBOOT:-$BUILD/uboot}
@@ -37,7 +38,7 @@ ROCKCHIP_TPL=${ROCKCHIP_TPL:-$RKBIN/bin/rk35/rk3568_ddr_1560MHz_v1.26.bin}
 
 usage() {
 	cat <<EOF
-usage: u-boot/build.sh
+usage: ./build.sh
 
 Build the ZSpace T2 U-Boot images into $OUT.
 Environment overrides: UBOOT, RKBIN, OUT, JOBS, CROSS_COMPILE, BL31,
@@ -52,7 +53,7 @@ case ${1:-} in
 esac
 
 if [ ! -d "$UBOOT" ]; then
-	echo "error: $UBOOT not found - run u-boot/fetch.sh first" >&2
+	echo "error: $UBOOT not found - run ./fetch.sh first" >&2
 	exit 1
 fi
 
@@ -77,7 +78,7 @@ fi
 
 for f in "$BL31" "$ROCKCHIP_TPL"; do
 	if [ ! -f "$f" ]; then
-		echo "error: missing blob $f - run u-boot/fetch.sh first," >&2
+		echo "error: missing blob $f - run ./fetch.sh first," >&2
 		echo "       or set BL31 / ROCKCHIP_TPL to the rkbin paths." >&2
 		exit 1
 	fi

@@ -1,0 +1,82 @@
+name: Build
+
+# Build the boot chain on pull requests and branch pushes, so breakage shows up
+# before a release.  No artefacts are kept: release.yml does that on a tag.
+#
+# arm64 only: that is what the board is, and GitHub's arm64 runners are free for
+# public repositories.  The cross compiler is installed even on the arm64
+# runner, because build.sh looks for aarch64-linux-gnu-gcc when CROSS_COMPILE is
+# unset.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 120
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          # git describe (the package version) needs the tags.
+          fetch-depth: 0
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              bison flex swig gcc-aarch64-linux-gnu dpkg
+
+      - name: Fetch the sources
+        run: ./fetch.sh
+
+      - name: Build U-Boot
+        run: ./build.sh
+
+      - name: Package
+        run: ./package.sh
+
+      - name: Inspect the package
+        run: |
+          set -eu
+          deb=$(ls build/t2-bootloader_*.deb)
+          dpkg-deb -I "$deb"
+          dpkg-deb -c "$deb"
+
+      - name: Smoke-test the updater
+        run: |
+          set -eu
+          deb=$(ls build/t2-bootloader_*.deb)
+          root=$(mktemp -d)
+          dpkg-deb -x "$deb" "$root"
+          lib=$root/usr/lib/t2-bootloader
+          truncate -s 64M "$root/disk.img"
+
+          T2_BOOTLOADER_LIBDIR=$lib "$root/usr/sbin/t2-bootloader-install" \
+              --device "$root/disk.img" --dry-run
+          T2_BOOTLOADER_LIBDIR=$lib "$root/usr/sbin/t2-bootloader-install" \
+              --device "$root/disk.img" --yes
+
+          dd if="$root/disk.img" of="$root/spl.bin" bs=512 skip=64 \
+             count=$(( $(wc -c < "$lib/idbloader.img") / 512 )) status=none
+          dd if="$root/disk.img" of="$root/uboot.bin" bs=512 skip=16384 \
+             count=$(( $(wc -c < "$lib/u-boot.itb") / 512 )) status=none
+          cmp "$root/spl.bin" "$lib/idbloader.img"
+          cmp "$root/uboot.bin" "$lib/u-boot.itb"
+          echo "updater: SPL at LBA 0x40 and U-Boot at LBA 0x4000 match the payload"

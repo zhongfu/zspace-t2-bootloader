@@ -1,0 +1,19 @@
+Package: t2-bootloader
+Version: @VERSION@
+Architecture: arm64
+Section: admin
+Priority: optional
+Maintainer: zhongfu <me@zhongfu.li>
+Depends: util-linux
+Installed-Size: @INSTALLED_SIZE@
+Description: ZSpace T2 boot chain (U-Boot) and its offline updater
+ Mainline U-Boot for the ZSpace T2 (Rockchip RK3568): the plain and installer
+ boot-chain images (idbloader/u-boot .itb pairs) and their compiled default
+ environments, plus /usr/sbin/t2-bootloader-install, which writes the SPL to
+ LBA 0x40 and U-Boot to LBA 0x4000 of a target disk after validating both
+ images and confirming the write.
+ .
+ The U-Boot environment (/uboot.env on the FAT boot partition) is never touched
+ by the updater; it belongs to the running system, not to this package.  The
+ files under /usr/lib/t2-bootloader are raw artefacts for the image build as
+ well: the image repository consumes them to assemble the installer card.

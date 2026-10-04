@@ -9,11 +9,12 @@
 #   rk3568_ddr_1560MHz_v1.26.bin  TPL (SRAM DDR init/training; RK3568 U-Boot
 #                                  does not init DRAM itself)
 #
-# Usage: u-boot/fetch.sh [-h]
+# Usage: ./fetch.sh [-h]
 set -eu
 
+# The split repo root *is* the old u-boot/ directory, so HERE is ROOT.
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-ROOT=$(CDPATH= cd -- "$HERE/.." && pwd)
+ROOT=$HERE
 
 BUILD=${BUILD:-$ROOT/build}
 UBOOT_SRC=${UBOOT_SRC:-$BUILD/uboot}
@@ -28,7 +29,7 @@ RKBIN_REF=${RKBIN_REF:-3e288fe814e059dd06833495f845cab04ac20a5c}
 
 usage() {
 	cat <<EOF
-usage: u-boot/fetch.sh
+usage: ./fetch.sh
 
 Fetch U-Boot $UBOOT_TAG into $UBOOT_SRC and the rkbin blobs into $RKBIN_SRC.
 Override with the environment variables UBOOT_SRC, RKBIN_SRC, BUILD,

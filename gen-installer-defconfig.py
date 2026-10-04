@@ -12,14 +12,15 @@ work was added to the plain defconfig and the installer image kept building
 with the old preboot.  Deriving it on every build makes that impossible.
 
 Usage: gen-installer-defconfig.py [UBOOT_TREE]
-UBOOT_TREE defaults to <repo>/build/uboot; u-boot/build.sh passes its tree.
+UBOOT_TREE defaults to <repo>/build/uboot; ./build.sh passes its tree.
 """
 
 import pathlib
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
-ROOT = HERE.parent
+# The split repo root *is* the old u-boot/ directory, so HERE is ROOT.
+ROOT = HERE
 DEFAULT_TREE = ROOT / "build" / "uboot"
 
 INSTALLER_BOOTCMD = (

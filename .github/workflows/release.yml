@@ -1,0 +1,168 @@
+name: Release
+
+# On a U-Boot-release tag (v2026.07): build the boot chain and the package, keep
+# them as a workflow artefact, and publish them on a GitHub release.  The tag
+# drives the package version - package.sh reads `git describe` - so tag the
+# release before publishing.
+#
+# GitHub matches tags with globs, not regular expressions (workflow syntax,
+# "Patterns to match branches and tags"): `v[0-9]*` is `v`, a digit, anything.
+on:
+  push:
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v<version> tag to build and publish
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 120
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve the tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          tag=${INPUT_TAG:-}
+          [ -n "$tag" ] || tag="${GITHUB_REF_NAME}"
+          case "$tag" in
+            v[0-9]*) ;;
+            *) echo "error: '$tag' is not a v<version> tag" >&2; exit 1 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "building $tag at $(git rev-parse --short HEAD)"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              bison flex swig gcc-aarch64-linux-gnu dpkg
+
+      - name: Build the boot chain and the package
+        run: |
+          ./fetch.sh
+          ./build.sh
+          ./package.sh
+
+      - name: Collect the release assets
+        run: |
+          set -eu
+          mkdir -p dist
+          cp build/t2-bootloader_*.deb dist/
+          cp build/out/u-boot.itb build/out/idbloader.img \
+             build/out/u-boot-installer.itb build/out/idbloader-installer.img \
+             build/out/u-boot-initial-env build/out/u-boot-installer-initial-env \
+             dist/
+          (cd dist && sha256sum t2-bootloader_*.deb u-boot.itb idbloader.img \
+              u-boot-installer.itb idbloader-installer.img \
+              u-boot-initial-env u-boot-installer-initial-env > SHA256SUMS)
+          ls -l dist
+
+      - name: Upload the assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          fetch-depth: 0
+
+      - name: Download the assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Build the release notes
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -eu
+          prev=$(git describe --tags --abbrev=0 --match 'v[0-9]*' \
+                   "${TAG}^" 2>/dev/null || true)
+          {
+            echo "## What changed"
+            echo
+            if [ -n "$prev" ]; then
+              echo "Changes since \`$prev\`:"
+              echo
+              git log --no-merges --pretty='* %s (%h)' "$prev..$TAG"
+            else
+              echo "Changes up to \`$TAG\`:"
+              echo
+              git log --no-merges --pretty='* %s (%h)' "$TAG"
+            fi
+            echo
+            echo "## How to update"
+            echo
+            echo "On the board: install the package, then write the boot chain."
+            echo
+            echo '```sh'
+            echo 'dpkg -i t2-bootloader_<version>_arm64.deb'
+            echo 't2-bootloader-install --dry-run    # validate and print the plan'
+            echo 't2-bootloader-install --yes        # write the running disk'
+            echo '```'
+            echo
+            echo "The six raw files are the boot-chain inputs the image build consumes."
+            echo "\`u-boot.itb\` and \`idbloader.img\` are the plain (eMMC) pair; the"
+            echo "\`-installer\` pair is what the SD card's loader partition carries."
+            echo
+            echo "## Recovery"
+            echo
+            echo "The RK3568 BootROM always loads the SPL from the eMMC at LBA 0x40, so an SD card cannot replace the first-stage loader. A board whose SPL is broken needs maskrom over USB; a board whose U-Boot or kernel is broken can be reinstalled from the installer SD card."
+            echo
+            cat dist/SHA256SUMS
+          } > "$RUNNER_TEMP/release-notes.md"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -eu
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A re-run of a failed job: refresh the files and the notes.
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --notes-file "$RUNNER_TEMP/release-notes.md"
+          else
+            gh release create "$TAG" dist/* \
+              --title "$TAG" --notes-file "$RUNNER_TEMP/release-notes.md" \
+              --verify-tag
+          fi
+          echo "published $TAG:"
+          gh release view "$TAG" --json url,assets --jq '.url, (.assets[].name)'

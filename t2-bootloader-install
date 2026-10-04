@@ -1,0 +1,344 @@
+#!/bin/sh
+# ZSpace T2: update the boot chain (SPL + U-Boot) on the eMMC from the running
+# system.
+#
+# The RK3568 BootROM loads the first-stage loader (`idbloader.img`: TPL + SPL)
+# from LBA 0x40 of the eMMC; that SPL then loads U-Boot (`u-boot.itb`, a FIT
+# carrying ATF + U-Boot + the board DT) from the fixed offset LBA 0x4000.  This
+# is the layout the installer writes (rootfs/initramfs/installer.sh in the
+# image repo) and the one images/t2-image.py encodes for the card.  `dpkg -i
+# t2-bootloader` stages the files under /usr/lib/t2-bootloader; this script is
+# what actually writes them.
+#
+# It is deliberately the careful path, because a torn write to this region
+# leaves the board maskrom-only until it is restored over USB (the image repo's
+# docs/tinkering.md describes that recovery):
+#
+#   * both images are validated - existence, non-empty size, sector alignment,
+#     the RKNS idbloader magic and the FDT/FIT magic - before the first write
+#     (the same magic lib/rkimg.py checks: `_FS_MAGICS` has RKNS at offset 0,
+#     `FDT_MAGIC` is 0xD00DFEED and `fdt_is_fit` wants /images and
+#     /configurations);
+#   * each image is checked against the device region it lands in (the SPL must
+#     stop before 0x4000; U-Boot must fit the vendor p1 `uboot`, 4 MiB, and stop
+#     before the kernel FIT at 0x8000);
+#   * the plan - file, size, sha256, byte offset, LBA - is printed, and every
+#     real write needs --yes.  Writing to the disk the running system is on is
+#     only reachable through that same flag, and says so explicitly;
+#   * a run with no evident recovery path (no removable card an installer could
+#     be booted from) is refused unless --force;
+#   * the writes are `dd ... conv=fsync` at the two fixed LBAs, then the bytes
+#     are read back and compared by sha256, so a short or misdirected write is
+#     reported instead of assumed;
+#   * the U-Boot environment is never touched.  It is the FAT file /uboot.env in
+#     partition 3 (`CONFIG_ENV_IS_IN_FAT`, `:3`), not part of either loader
+#     region, and this script never mounts or formats anything.
+#
+# --device accepts a whole disk *or a regular file*: the tests write a sparse
+# file, and the same byte ranges are written.  A file target is not a boot
+# device, so it cannot brick a board - that is what makes the updater testable
+# off the board, and it is why the recovery gate only guards block devices.
+#
+# Usage: t2-bootloader-install [--device DEV] [--dry-run] [--yes] [--force]
+set -eu
+
+LIBDIR=${T2_BOOTLOADER_LIBDIR:-/usr/lib/t2-bootloader}
+SPL_FILE=$LIBDIR/idbloader.img
+UBOOT_FILE=$LIBDIR/u-boot.itb
+
+SECTOR=512
+SPL_LBA=64              # 0x40: the BootROM's SPL offset (rkimg.SECTOR * 0x40)
+UBOOT_LBA=16384         # 0x4000: the SPL's fixed U-Boot offset
+SPL_OFFSET=$((SPL_LBA * SECTOR))
+UBOOT_OFFSET=$((UBOOT_LBA * SECTOR))
+# Ceilings for the two regions.  The SPL must not reach U-Boot's offset; U-Boot
+# must fit the vendor p1 `uboot` (8192 sectors = 4 MiB, images/t2-image.py's
+# VENDOR_TABLE) and stop before the kernel FIT at LBA 0x8000.
+SPL_MAX=$(((UBOOT_LBA - SPL_LBA) * SECTOR))
+UBOOT_MAX=$((8192 * SECTOR))
+
+dev=''
+dry_run=0
+assume_yes=0
+force=0
+
+log() { echo "t2-bootloader-install: $*"; }
+die() { echo "t2-bootloader-install: $*" >&2; exit 1; }
+
+usage() {
+	cat <<EOF
+usage: t2-bootloader-install [--device DEV] [--dry-run] [--yes] [--force]
+
+Write the SPL (idbloader.img) to LBA 0x40 and U-Boot (u-boot.itb) to LBA
+0x4000 of DEV.  DEV defaults to the whole disk carrying the running root; it
+may also be a regular file (tests).  The U-Boot environment is never touched.
+
+  --device DEV  target whole disk, or a regular file; default: the running
+                root filesystem's disk
+  --dry-run     validate the images and print the plan; write nothing
+  --yes         confirm the write (required for every real write)
+  --force       proceed without an evident recovery path (no removable card)
+
+Environment: T2_BOOTLOADER_LIBDIR (default /usr/lib/t2-bootloader),
+T2_BOOTLOADER_ROOTDEV (override the detected running root disk).
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# arguments
+# ---------------------------------------------------------------------------
+while [ $# -gt 0 ]; do
+	case $1 in
+	--device) [ $# -ge 2 ] || die "--device needs a path"; dev=$2; shift 2 ;;
+	--device=*) dev=${1#--device=}; shift ;;
+	--dry-run) dry_run=1; shift ;;
+	--yes | -y) assume_yes=1; shift ;;
+	--force) force=1; shift ;;
+	-h | --help) usage; exit 0 ;;
+	*) die "unknown argument '$1' (try --help)" ;;
+	esac
+done
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+human() { # bytes
+	n=$1
+	if [ "$n" -lt 1024 ]; then
+		printf '%s B' "$n"
+		return 0
+	fi
+	n=$((n / 1024))
+	if [ "$n" -lt 1024 ]; then
+		printf '%s KiB' "$n"
+		return 0
+	fi
+	n=$((n / 1024))
+	if [ "$n" -lt 1024 ]; then
+		printf '%s MiB' "$n"
+		return 0
+	fi
+	printf '%s GiB' "$((n / 1024))"
+}
+
+sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
+
+file_magic() { # first 4 bytes, lowercase hex ("524b4e53" = RKNS)
+	dd if="$1" bs=4 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n'
+}
+
+# "which disk holds this rootfs".  The default target, because the boot chain a
+# board boots is the one on the disk it booted from.  A test override is kept
+# so the running-device refusal can be exercised without a block device.
+root_disk() {
+	if [ -n "${T2_BOOTLOADER_ROOTDEV:-}" ]; then
+		printf '%s\n' "$T2_BOOTLOADER_ROOTDEV"
+		return 0
+	fi
+	src=$(findmnt -no SOURCE / 2>/dev/null || true)
+	case "$src" in /dev/*) ;; *) return 0 ;; esac
+	if command -v lsblk >/dev/null 2>&1; then
+		parent=$(lsblk -no PKNAME "$src" 2>/dev/null | head -n 1 || true)
+		if [ -n "$parent" ]; then
+			printf '/dev/%s\n' "$parent"
+			return 0
+		fi
+	fi
+	# No lsblk: a whole disk has no /sys/class/block/<name>/partition; a
+	# partition is stripped of its `pN`/`N` suffix.
+	name=${src##*/}
+	if [ ! -e "/sys/class/block/$name/partition" ]; then
+		printf '%s\n' "$src"
+		return 0
+	fi
+	case "$src" in
+	*p[0-9]*) printf '%s\n' "${src%p[0-9]*}" ;;
+	*[0-9]) printf '%s\n' "${src%[0-9]}" ;;
+	*) printf '%s\n' "$src" ;;
+	esac
+}
+
+# A recovery path is a removable block device - in practice the SD card an
+# installer can be booted from.  eMMC boot partitions and loop/ram devices are
+# not cards.  $1 is the target's kernel name, excluded so the disk being
+# written is never mistaken for its own rescue.
+recovery_evident() {
+	for s in /sys/class/block/*; do
+		n=${s##*/}
+		case "$n" in loop* | ram* | zram* | sr* | *boot0 | *boot1) continue ;; esac
+		if [ -n "$1" ] && [ "$n" = "$1" ]; then
+			continue
+		fi
+		[ "$(cat "$s/removable" 2>/dev/null || echo 0)" = 1 ] || continue
+		[ "$(cat "$s/size" 2>/dev/null || echo 0)" -gt 0 ] || continue
+		printf '%s\n' "$n"
+		return 0
+	done
+	return 1
+}
+
+verify_spl() { # $1 = path
+	if [ ! -f "$1" ]; then
+		die "$1: missing (install t2-bootloader, or set T2_BOOTLOADER_LIBDIR)"
+	fi
+	size=$(wc -c < "$1")
+	[ "$size" -gt 0 ] || die "$1: empty"
+	magic=$(file_magic "$1")
+	if [ "$magic" != 524b4e53 ]; then
+		die "$1: not an idbloader (magic $magic, expected RKNS 524b4e53)"
+	fi
+	[ $((size % SECTOR)) -eq 0 ] || die "$1: $size bytes is not whole sectors"
+	[ "$size" -le "$SPL_MAX" ] ||
+		die "$1: $size bytes would reach U-Boot's offset at LBA 0x4000"
+}
+
+verify_uboot() { # $1 = path
+	if [ ! -f "$1" ]; then
+		die "$1: missing (install t2-bootloader, or set T2_BOOTLOADER_LIBDIR)"
+	fi
+	size=$(wc -c < "$1")
+	[ "$size" -gt 0 ] || die "$1: empty"
+	magic=$(file_magic "$1")
+	if [ "$magic" != d00dfeed ]; then
+		die "$1: not a flattened device tree (magic $magic, expected d00dfeed)"
+	fi
+	# FIT check, the two nodes rkimg.fdt_is_fit() requires.  Binary-safe grep
+	# (-a): the strings live in the FDT string block.
+	LC_ALL=C grep -aq configurations "$1" ||
+		die "$1: a device tree, but not a FIT (no /configurations)"
+	LC_ALL=C grep -aq images "$1" ||
+		die "$1: a device tree, but not a FIT (no /images)"
+	[ $((size % SECTOR)) -eq 0 ] || die "$1: $size bytes is not whole sectors"
+	[ "$size" -le "$UBOOT_MAX" ] ||
+		die "$1: $size bytes does not fit p1 uboot ($UBOOT_MAX bytes)"
+}
+
+target_size() {
+	if [ "$target_kind" = block ]; then
+		if command -v blockdev >/dev/null 2>&1; then
+			blockdev --getsize64 "$dev"
+		else
+			printf '%s\n' $(( $(cat "/sys/class/block/$tkn/size") * SECTOR ))
+		fi
+	else
+		wc -c < "$dev"
+	fi
+}
+
+write_at() { # $1 = image, $2 = LBA, $3 = label
+	log "writing $3 at LBA $(printf '0x%x' "$2") ($(printf '0x%x' "$(($2 * SECTOR))"))"
+	dd if="$1" of="$dev" bs="$SECTOR" seek="$2" conv=fsync,notrunc 2>/dev/null ||
+		die "$3: dd failed"
+}
+
+verify_at() { # $1 = image, $2 = LBA, $3 = label
+	want=$(sha256_of "$1")
+	count=$(( $(wc -c < "$1") / SECTOR ))
+	got=$(dd if="$dev" bs="$SECTOR" skip="$2" count="$count" 2>/dev/null | sha256sum | cut -d' ' -f1)
+	if [ "$want" != "$got" ]; then
+		die "$3: read-back mismatch (wrote $want, read $got)"
+	fi
+	log "$3: read-back sha256 $got matches"
+}
+
+# ---------------------------------------------------------------------------
+# resolve and classify the target
+# ---------------------------------------------------------------------------
+if [ -z "$dev" ]; then
+	dev=$(root_disk)
+	[ -n "$dev" ] || die "cannot tell which disk the running root is on - pass --device"
+fi
+[ -e "$dev" ] || die "$dev: no such block device or file (pass --device)"
+dev=$(readlink -f -- "$dev" 2>/dev/null || printf '%s' "$dev")
+
+target_kind=''
+tkn=''
+if [ -b "$dev" ]; then
+	target_kind=block
+	tkn=${dev##*/}
+	[ -e "/sys/class/block/$tkn" ] || die "$dev: not a whole disk (no /sys/class/block/$tkn)"
+	if [ -e "/sys/class/block/$tkn/partition" ]; then
+		die "$dev is a partition - pass the whole disk, not a partition of it"
+	fi
+elif [ -f "$dev" ]; then
+	target_kind=file
+else
+	die "$dev: not a block device or a regular file"
+fi
+
+# ---------------------------------------------------------------------------
+# validate the payload, then the target's capacity
+# ---------------------------------------------------------------------------
+verify_spl "$SPL_FILE"
+verify_uboot "$UBOOT_FILE"
+
+spl_size=$(wc -c < "$SPL_FILE")
+uboot_size=$(wc -c < "$UBOOT_FILE")
+tbytes=$(target_size)
+need=$((UBOOT_OFFSET + uboot_size))
+if [ "$tbytes" -lt "$need" ]; then
+	die "$dev is $(human "$tbytes"), too small: U-Boot would end at $(human "$need")"
+fi
+
+# ---------------------------------------------------------------------------
+# recovery and confirmation gates
+# ---------------------------------------------------------------------------
+if [ "$target_kind" = block ]; then
+	card=''
+	if card=$(recovery_evident "$tkn"); then
+		log "recovery path: removable disk $card is present"
+	elif [ "$force" = 1 ]; then
+		log "recovery path: none evident; --force given, continuing"
+	else
+		die "no recovery path: no removable card is present, so a failed write would leave only maskrom.  Insert an installer SD card, or pass --force"
+	fi
+else
+	log "recovery path: $dev is a regular file, so no board can be bricked by this write"
+fi
+
+# Is the target the disk the running system is on?  Derived from /, so an
+# explicitly named other disk is allowed; a test override only makes this
+# *stricter*, never weaker.  Compared by basename so /dev/disk/by-id symlinks
+# and /dev/mmcblk0 are the same device.
+rootdev=$(root_disk)
+on_running=0
+if [ -n "$rootdev" ] && [ "${rootdev##*/}" = "${dev##*/}" ]; then
+	on_running=1
+fi
+
+if [ "$dry_run" = 0 ]; then
+	if [ "$on_running" = 1 ] && [ "$assume_yes" = 0 ]; then
+		die "$dev is the device the running system is on - pass --yes to write it"
+	fi
+	if [ "$assume_yes" = 0 ]; then
+		die "about to write the boot chain to $dev - pass --yes to confirm"
+	fi
+fi
+
+# ---------------------------------------------------------------------------
+# plan
+# ---------------------------------------------------------------------------
+log "target $dev ($target_kind, $(human "$tbytes"))"
+if [ "$on_running" = 1 ]; then
+	log "  this target carries the running root"
+fi
+log "  $(basename "$SPL_FILE")  $spl_size bytes  sha256 $(sha256_of "$SPL_FILE")"
+log "    -> LBA 0x40 (byte offset 0x$(printf '%x' "$SPL_OFFSET"))"
+log "  $(basename "$UBOOT_FILE")  $uboot_size bytes  sha256 $(sha256_of "$UBOOT_FILE")"
+log "    -> LBA 0x4000 (byte offset 0x$(printf '%x' "$UBOOT_OFFSET"))"
+log "  the U-Boot environment (/uboot.env on the FAT boot partition, p3) is not touched"
+
+if [ "$dry_run" = 1 ]; then
+	log "dry run: images valid, plan printed, nothing written"
+	exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# write and read back
+# ---------------------------------------------------------------------------
+write_at "$SPL_FILE" "$SPL_LBA" "SPL"
+verify_at "$SPL_FILE" "$SPL_LBA" "SPL"
+write_at "$UBOOT_FILE" "$UBOOT_LBA" "U-Boot"
+verify_at "$UBOOT_FILE" "$UBOOT_LBA" "U-Boot"
+
+log "boot chain updated: SPL at LBA 0x40, U-Boot at LBA 0x4000"
