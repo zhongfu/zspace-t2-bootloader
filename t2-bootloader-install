@@ -160,13 +160,17 @@ root_disk() {
 
 # A recovery path is a removable block device - in practice the SD card an
 # installer can be booted from.  eMMC boot partitions and loop/ram devices are
-# not cards.  $1 is the target's kernel name, excluded so the disk being
-# written is never mistaken for its own rescue.
+# not cards.  $1 is the target's kernel name and $2 the running root's, both
+# excluded: the disk being written is not its own rescue, and neither is the
+# disk the running system already occupies.
 recovery_evident() {
 	for s in /sys/class/block/*; do
 		n=${s##*/}
 		case "$n" in loop* | ram* | zram* | sr* | *boot0 | *boot1) continue ;; esac
 		if [ -n "$1" ] && [ "$n" = "$1" ]; then
+			continue
+		fi
+		if [ -n "$2" ] && [ "$n" = "$2" ]; then
 			continue
 		fi
 		[ "$(cat "$s/removable" 2>/dev/null || echo 0)" = 1 ] || continue
@@ -215,10 +219,15 @@ verify_uboot() { # $1 = path
 
 target_size() {
 	if [ "$target_kind" = block ]; then
-		if command -v blockdev >/dev/null 2>&1; then
+		# sysfs first: the size needs no read permission on the device node, and
+		# it works while the disk is in use.  blockdev is the fallback for a
+		# kernel without /sys/class/block.
+		if [ -r "/sys/class/block/$tkn/size" ]; then
+			printf '%s\n' $(( $(cat "/sys/class/block/$tkn/size") * SECTOR ))
+		elif command -v blockdev >/dev/null 2>&1; then
 			blockdev --getsize64 "$dev"
 		else
-			printf '%s\n' $(( $(cat "/sys/class/block/$tkn/size") * SECTOR ))
+			die "$dev: cannot read the device size"
 		fi
 	else
 		wc -c < "$dev"
@@ -283,9 +292,18 @@ fi
 # ---------------------------------------------------------------------------
 # recovery and confirmation gates
 # ---------------------------------------------------------------------------
+# The disk the running system is on, computed once: it is the default target,
+# it is what the recovery scan must not mistake for a rescue card, and writing
+# it is what --yes exists for.
+rootdev=$(root_disk)
+rootname=''
+if [ -n "$rootdev" ]; then
+	rootname=${rootdev##*/}
+fi
+
 if [ "$target_kind" = block ]; then
 	card=''
-	if card=$(recovery_evident "$tkn"); then
+	if card=$(recovery_evident "$tkn" "$rootname"); then
 		log "recovery path: removable disk $card is present"
 	elif [ "$force" = 1 ]; then
 		log "recovery path: none evident; --force given, continuing"
@@ -300,7 +318,6 @@ fi
 # explicitly named other disk is allowed; a test override only makes this
 # *stricter*, never weaker.  Compared by basename so /dev/disk/by-id symlinks
 # and /dev/mmcblk0 are the same device.
-rootdev=$(root_disk)
 on_running=0
 if [ -n "$rootdev" ] && [ "${rootdev##*/}" = "${dev##*/}" ]; then
 	on_running=1
