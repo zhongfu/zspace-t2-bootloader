@@ -37,7 +37,10 @@ u-boot-initial-env u-boot-installer-initial-env"
 
 die() { echo "package.sh: $*" >&2; exit 1; }
 
-# git describe -> Debian upstream version (see the header).
+# git describe -> Debian upstream version (see the header).  The dirty suffix
+# is re-appended last: Debian forbids `-` inside an upstream version, so
+# `v2026.07-3-gabc1234-dirty` must become `2026.07+git3.gabc1234+dirty`, not
+# `2026.07-3-gabc1234+dirty`.
 version_upstream() {
 	desc=$(git -C "$ROOT" describe --tags --match 'v[0-9]*' --dirty 2>/dev/null || true)
 	if [ -z "$desc" ]; then
@@ -47,11 +50,15 @@ version_upstream() {
 			sed 's/^\${UBOOT_TAG:-//; s/}$//')
 		[ -n "$desc" ] || die "no v* tag and no UBOOT_TAG in fetch.sh"
 	fi
-	printf '%s' "$desc" | sed \
+	up=$(printf '%s' "$desc" | sed \
 		-e 's/^v//' \
-		-e 's/-dirty$/+dirty/' \
+		-e 's/-dirty$//' \
 		-e 's/-\([0-9][0-9]*\)-g\([0-9a-f][0-9a-f]*\)$/+git\1.g\2/' \
-		-e 's/-rc\([0-9][0-9]*\)/~rc\1/'
+		-e 's/-rc\([0-9][0-9]*\)/~rc\1/')
+	case "$desc" in
+	*-dirty) up=$up+dirty ;;
+	esac
+	printf '%s' "$up"
 }
 
 version=$(version_upstream)-$REV
@@ -75,7 +82,10 @@ install -m 755 "$ROOT/t2-bootloader-install" "$work/usr/sbin/t2-bootloader-insta
 chmod 755 "$work" "$work/DEBIAN" "$work/usr" "$work/usr/lib" \
 	"$work/usr/lib/t2-bootloader" "$work/usr/sbin"
 
-installed_size=$(du -sk "$work/usr" | cut -f1)
+# Installed-Size is an estimate in KiB.  --apparent-size, not the default block
+# count: on the ZFS build pool `du -sk` reports freshly written files as 0 until
+# the next transaction group commits, which produced an absurd Installed-Size.
+installed_size=$(du -sk --apparent-size "$work/usr" | cut -f1)
 sed -e "s/@VERSION@/$version/g" \
 	-e "s/@INSTALLED_SIZE@/$installed_size/g" \
 	"$ROOT/packaging/DEBIAN/control.in" > "$work/DEBIAN/control"
