@@ -62,7 +62,13 @@ CONFIG_BOOTCOUNT_ENV=y
 # the previous kernel /Image.old with the same cmdline as the primary extlinux
 # entry - mmc0 (eMMC) first, then mmc1 (SD card) as the rescue device - and
 # leaves t2_fallback=1 so the userspace commit unit promotes the fallback slot.
-CONFIG_BOOTCOUNT_ALTBOOTCMD="setenv t2_fallback 1; saveenv; setenv bootargs root=LABEL=zspace-rootfs rootfstype=ext4 rw rootwait rootflags=errors=remount-ro panic=15; if fatload mmc 0:3 ${kernel_addr_r} /Image.old; then setenv t2dev 0; else setenv t2dev 1; fatload mmc 1:3 ${kernel_addr_r} /Image.old; fi; fatload mmc ${t2dev}:3 ${fdt_addr_r} /rk3568-t2.dtb; booti ${kernel_addr_r} - ${fdt_addr_r}"
+# The ramdisk is handed over as the *file* /initrd.img and as "<addr>:<size>"
+# (CONFIG_SUPPORT_RAW_INITRD, enabled via BOOTSTD's selects): a direct bootm has
+# no extlinux entry to name one, and passing the fdt address as the ramdisk
+# argument instead would make U-Boot try to read an FDT as a FIT.  /Image.old is
+# a FIT, so this is bootm, not booti; with no /initrd.img on an old tree the
+# argument is "-" and the kernel mounts root= by label without an initramfs.
+CONFIG_BOOTCOUNT_ALTBOOTCMD="setenv t2_fallback 1; saveenv; setenv bootargs root=LABEL=zspace-rootfs rootfstype=ext4 rw rootwait rootflags=errors=remount-ro panic=15; if fatload mmc 0:3 ${kernel_addr_r} /Image.old; then setenv t2dev 0; else setenv t2dev 1; fatload mmc 1:3 ${kernel_addr_r} /Image.old; fi; if fatload mmc ${t2dev}:3 ${ramdisk_addr_r} /initrd.img; then setenv t2rd ${ramdisk_addr_r}:${filesize}; else setenv t2rd -; fi; fatload mmc ${t2dev}:3 ${fdt_addr_r} /rk3568-t2.dtb; bootm ${kernel_addr_r} ${t2rd} ${fdt_addr_r}"
 CONFIG_SPL_CLK=y
 CONFIG_ROCKCHIP_GPIO=y
 CONFIG_SYS_I2C_ROCKCHIP=y
